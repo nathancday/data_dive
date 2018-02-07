@@ -1,0 +1,246 @@
+---
+title: "Crime Data Dive"
+author: "Nate Day"
+date: "2/4/2018"
+output:
+  ioslides_presentation: 
+    incremental: yes
+    smaller: yes
+  slidy_presentation: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(magrittr)
+library(tidyverse)
+library(broom)
+library(viridis)
+library(sf)
+library(tidycensus)
+```
+
+## Why drug crime? {.build}
+
+- Cooler than parking tickets
+- Access to ~31,000 observations, over 5 years!
+- Have you seen The Wire?
+
+![](images/the_wire.gif)
+
+## Goals of this talk {.build}
+
+- Show distribution of crime in our city
+- Provide an open-template for analyzing more data
+- Get people excited about using R
+
+![](images/excited.gif)
+
+## Data Process {.build}
+
+1. Open Data Portal - Crime Reports
+2. Geocode via Google Map API
+3. Use `library(sf) %>% tidyverse` for spatial data exploration
+4. Model and test patterns with `library(spdep)` and `glm()`
+
+```{r libs, echo = TRUE, message = FALSE, warning = FALSE}
+library(tidyverse) # duh
+library(magrittr) # %<>% life
+library(viridis) # it's pretty
+library(sf) # the new kid
+library(spdep) # the grandaddy
+```
+
+## Where is crime happening? {.build}
+
+```{r crime_map, echo=FALSE}
+my_github <- "https://github.com/NathanCDay/cville_crime/raw/master/data/"
+crime_counts <- readRDS(gzcon(url(paste0(my_github,"crime_counts_sf.RDS"))))
+census <- readRDS(gzcon(url(paste0(my_github,"census_sf.RDS"))))
+
+ggplot(crime_counts) +
+    geom_sf(data = census) +
+    geom_sf(aes(size = n, color = n, alpha = n)) +
+    scale_color_viridis() +
+    facet_wrap(~drug_flag) 
+
+crime_counts %<>% st_set_geometry(NULL)
+```
+
+
+## Most frequent addresses {.smaller .build}
+Top 3 address for drug crime and not drug crime
+```{r most_frequent, echo = T}
+arrange(crime_counts, -n) %>% group_by(drug_flag) %>% slice(1:3)
+```
+
+The police station's address is 606 E Market Street....
+
+## What is going on at the police station? {.smaller .build}
+
+"The answer is quite simple - when individuals walk in to the police department to file a report the physical address of the department (606 E Market Street) is often used in that initial report if no other known address is available at the time. This is especially true for incidents of found or lost property near the downtown mall where there is no true known incident location. The same is true for any warrant services that result in a police report occurring at the police department." - CPD
+
+<div 
+![](images/what_police.gif)
+
+## Test if proportions are different {.smaller .build}
+
+```{r police_station_proportions, echo = TRUE}
+station_props <- arrange(crime_counts, -n) %>%
+    group_by(drug_flag) %>%
+    add_count(wt = n) %>%
+    slice(1)
+
+with(station_props, prop.test(n, nn)) %>% tidy
+```
+
+## Aggregate into areas {.smaller .build}
+
+Census blocks make a lot of sense becuase:
+
++ Tons of data in Census and American Community Surveys
++ Reputable source with code books and APIs
++ Easy to access in R via ODP and `library(tidycensus)`
+
+![](images/do_it.gif)
+
+## Start to do it {.smaller .build}
+```{r census_pop, echo = TRUE, warning=FALSE, message=FALSE, fig.height=4, cache = TRUE}
+long_url <- "https://opendata.arcgis.com/datasets/e60c072dbb734454a849d21d3814cc5a_14.geojson"
+census <- geojsonio::geojson_read(long_url, what = "sp") %>%
+    st_as_sf()
+
+ggplot(census, aes(fill = HU_Vacant / Housing_Units)) +
+    geom_sf() + scale_fill_viridis()
+```
+
+## Keep doing it {.smaller .build}
+
++ Start with geocoded version
+```{r raw_geo, message=FALSE, echo = TRUE}
+crime <- read_csv("https://github.com/NathanCDay/cville_crime/raw/master/crime_geocode.csv")
+crime %<>% filter(complete.cases(.))
+crime %<>% filter(address != "600 E MARKET ST Charlottesville VA")
+```
+
++ Convert to `sf`, with same CRS (critical)
+```{r crime_sf, echo = TRUE}
+crime %<>% st_as_sf(coords = c("lon", "lat"), crs = st_crs(census))
+```
+
++ Use `sf::st_within()` and friends
+```{r st_within, echo = TRUE, message = FALSE}
+crime %<>% mutate(within = st_within(crime, census) %>% as.numeric) %>% 
+    filter(!is.na(within))
+```
+
+There are bunch of other great `st_x(sf_a, sf_b)` functions too. If you want to do it, there's a tool for it.
+
+## Done with it {.smaller .build}
+
++ Flag by interest
+```{r drug_flag, echo = TRUE}
+crime %<>% mutate(drug_flag = ifelse(grepl("drug", Offense, ignore.case = TRUE),
+                                     "drugs", "not_drugs"))
+```
+
++ Summarise with `tidyverse`
+
+```{r tidy_sum, echo = TRUE}
+crime_block <- st_set_geometry(crime, NULL) %>% # remove geometry for spread() to work
+    group_by(within, drug_flag) %>%
+    count() %>%
+    spread(drug_flag, n) %>%
+    mutate(frac_drugs = drugs / sum(drugs + not_drugs)) %>%
+    ungroup() # geom_sf doesn't care for grouped dfs/tbls
+```
+
++ Join in
+```{r, echo = TRUE}
+census %<>% inner_join(crime_block, by = c("OBJECTID" = "within"))
+```
+
+## Hot blocks {.smaller}
+
+```{r, echo = TRUE}
+ggplot(census, aes(fill = frac_drugs)) +
+    geom_sf() + scale_fill_viridis()
+```
+
+## Is it random? {.smaller}
+
+Test with Moran's I statistic
+
+```{r, fig.height = 3}
+census_sp <- as(census, "Spatial")
+block_wnb <- poly2nb(census_sp) %>% nb2listw
+moran.mc(census_sp$frac_drugs, block_wnb, nsim = 999) %>% tidy
+```
+
+## Get more data {.smaller}
+Get median `income` and `age` data from the American Community Survey via `tidycensus` to supplement housing and demographics from the Census.
+
+```{r model_vars, echo=F, fig.height = 4, warning =F, message = F}
+cvl <- get_acs(geography = "block group", county = "Charlottesville", state = "VA",
+               variables = c("B19013_001", "B01002_001") )
+
+decode <- c("income", "age") %>% set_names(c("B19013_001", "B01002_001"))
+cvl$variable %<>% decode[.]
+
+cvl %<>% select(GEOID, variable, estimate) %>%
+    spread(variable, estimate)
+
+# ggplot(cvl, aes(age, income)) +
+#     geom_point()
+# missing values
+# let's impute them by neighbors
+
+cvl %<>% rename(BlockGroup = GEOID)
+
+census %<>% full_join(cvl)
+
+# sequester the missing values value
+miss <- census %>% filter(is.na(income))
+
+# calculate the mean its neightbors
+miss$income <- st_touches(miss, census) %>% # return the row_ids for adjacent polygons
+    map_dbl(~ census[., ] %>% with(mean(income))) # calculate the means per missing block
+
+# builder decoder
+dc <- miss$income %>% set_names(miss$OBJECTID) 
+    
+# back together again
+census %<>% mutate(income = ifelse(is.na(income), dc[as.character(OBJECTID)], income))
+
+census %<>% mutate(frac_black = Black / Population,
+                   frac_vacant = HU_Vacant / Housing_Units)
+
+
+# pred column positions for ggpairs()
+pred_cols <- match(c("frac_drugs", "frac_vacant", "age", "income", "frac_black"), names(census))
+
+library(GGally)
+ggpairs(census, columns = pred_cols)
+
+```
+
+## What are the strong predictors? {.smaller .build}
+
+Since the response is the proportion of drug crime to total, i.e. bounded by 0 and 1, we want to use the quasibinomial distribution instead of the Gaussian.
+
+```{r mod_sum}
+mod <- glm(frac_drugs ~  frac_black + frac_vacant + income + age,
+           data = census, family = quasibinomial())
+summary(mod) %>% coefficients()
+```
+
+Test `resid(mod)` again for spatial correlation, a good model should have randomly dispearsed residuals.
+
+```{r}
+moran.mc(resid(mod), block_wnb, nsim = 999) %>% tidy
+```
+
+
+
+## Questions? | Thanks for listening
+
+![](images/what.gif)
